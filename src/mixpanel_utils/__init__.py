@@ -540,6 +540,13 @@ class MixpanelUtils(object):
     ):
         """Deletes the specified People profiles with the $delete operation and optionally creates a backup file
 
+        When using query_params (or fetching all profiles), this method uses a file-based approach to avoid
+        loading all profiles into memory at once. Profiles are streamed to a temporary NDJSON file, optionally
+        backed up, and then delete operations are dispatched by reading from the file.
+
+        When using the profiles parameter (list or file), the original in-memory approach via people_operation()
+        is used for backwards compatibility.
+
         :param profiles: Can be a list of profiles or the name of a file containing a JSON array or CSV of profiles.
             Alternative to query_params. (Default value = None)
         :param query_params: Parameters to query /engage API. Alternative to profiles param. (Default value = None)
@@ -558,16 +565,63 @@ class MixpanelUtils(object):
         :rtype: int
 
         """
-        return self.people_operation(
-            "$delete",
-            "",
-            profiles=profiles,
-            query_params=query_params,
-            timezone_offset=timezone_offset,
-            ignore_alias=ignore_alias,
-            backup=backup,
-            backup_file=backup_file,
+        if profiles is not None and query_params is not None:
+            MixpanelUtils.LOGGER.error(
+                "profiles and query_params both provided, please use one or the other"
+            )
+            return
+
+        # When profiles are provided directly, use the standard in-memory path
+        if profiles is not None:
+            return self.people_operation(
+                "$delete",
+                "",
+                profiles=profiles,
+                timezone_offset=timezone_offset,
+                ignore_alias=ignore_alias,
+                backup=backup,
+                backup_file=backup_file,
+            )
+
+        # File-based path for query_params or fetching all profiles
+        if not self.token:
+            raise ValueError("Project token required for People operation!")
+
+        # Query engage API and write results directly to a temp NDJSON file
+        temp_file = "delete_engage_{:.0f}.ndjson".format(time.time())
+        profile_count = self.query_engage_to_file(
+            temp_file, params=query_params, timezone_offset=timezone_offset
         )
+
+        if profile_count == 0:
+            MixpanelUtils.LOGGER.warning("No profiles found to delete")
+            os.remove(temp_file)
+            return 0
+
+        # Create backup from the temp file if requested
+        if backup:
+            if backup_file is None:
+                backup_file = "backup_{:.0f}.json".format(time.time())
+            if backup_file.endswith(".csv"):
+                MixpanelUtils._export_csv_to_file(temp_file, backup_file)
+            else:
+                shutil.copy2(temp_file, backup_file)
+
+        # Dispatch delete batches by reading from the file
+        self._dispatch_batches_from_file(
+            self.import_api,
+            "engage",
+            temp_file,
+            [{}, self.token, "$delete", "", ignore_alias, False],
+        )
+
+        # Clean up temp file
+        os.remove(temp_file)
+
+        MixpanelUtils.LOGGER.debug(
+            f"$delete operation applied to {profile_count} profiles"
+        )
+        return profile_count
     
     def group_delete(
             self,
@@ -2267,6 +2321,112 @@ class MixpanelUtils(object):
             )
             return
 
+    def _get_default_workspace_id(self):
+        """Queries the Mixpanel API to get the default workspace ID for this project
+
+        :return: The workspace ID
+        :rtype: int
+
+        """
+        if hasattr(self, "_workspace_id") and self._workspace_id is not None:
+            return self._workspace_id
+        response = self.request(
+            self.formatted_api, ["workspaces"], {}
+        )
+        data = json.loads(response)
+        if isinstance(data, dict) and "results" in data:
+            workspaces = data["results"]
+        elif isinstance(data, list):
+            workspaces = data
+        else:
+            MixpanelUtils.LOGGER.error(
+                f"Unexpected response from /workspaces: {response}"
+            )
+            return None
+        if workspaces:
+            self._workspace_id = workspaces[0].get("id")
+            return self._workspace_id
+        return None
+
+    @staticmethod
+    def _export_csv_to_file(input_file, output_file):
+        """Reads profiles from a NDJSON file and writes them to a CSV file
+
+        :param input_file: Path to a NDJSON file containing profiles
+        :param output_file: Path to the CSV file to write
+        :type input_file: str
+        :type output_file: str
+        :return: Number of profiles written
+        :rtype: int
+
+        """
+        # First pass: collect all property keys
+        all_keys = set()
+        count = 0
+        with open(input_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                profile = json.loads(line)
+                if "$properties" in profile:
+                    all_keys.update(profile["$properties"].keys())
+                count += 1
+
+        if count == 0:
+            MixpanelUtils.LOGGER.error("No data to write!")
+            return 0
+
+        sorted_keys = sorted(all_keys)
+        header = ["$distinct_id"] + sorted_keys
+
+        # Second pass: write CSV rows
+        with open(output_file, "w", encoding="utf-8") as out_f:
+            writer = csv.writer(out_f)
+            writer.writerow(header)
+            with open(input_file, "r", encoding="utf-8") as in_f:
+                for line in in_f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    profile = json.loads(line)
+                    row = [profile.get("$distinct_id", "")]
+                    props = profile.get("$properties", {})
+                    for key in sorted_keys:
+                        field = props.get(key, "")
+                        if isinstance(field, (list, dict)):
+                            row.append(json.dumps(field))
+                        else:
+                            row.append(field)
+                    writer.writerow(row)
+
+        return count
+
+    def query_engage_to_file(self, output_file, params=None, timezone_offset=None):
+        """Queries the /engage API and writes results directly to a NDJSON file instead of memory
+
+        :param output_file: Path to write the NDJSON results file
+        :param params: Parameters to use for the /engage API request (Default value = None)
+        :param timezone_offset: UTC offset in hours of project timezone setting (Default value = None)
+        :type output_file: str
+        :type params: dict
+        :type timezone_offset: int | float
+        :return: Number of profiles written to file
+        :rtype: int
+
+        """
+        if params is None:
+            params = {}
+        if "behaviors" in params and timezone_offset is None:
+            raise RuntimeError("timezone_offset required if params include behaviors")
+        elif "behaviors" in params:
+            params["as_of_timestamp"] = int(int(time.time()) + (timezone_offset * 3600))
+
+        engage_paginator = ConcurrentPaginator(
+            self._get_engage_page, concurrency=self.read_pool_size
+        )
+        return engage_paginator.fetch_all_to_file(output_file, params)
+
     def _get_engage_page(self, params):
         """Fetches and returns the response from an /engage request
 
@@ -2283,6 +2443,72 @@ class MixpanelUtils(object):
         else:
             MixpanelUtils.LOGGER.error(f"Invalid response from /engage: {response}")
             return
+
+    def _dispatch_batches_from_file(
+            self, base_url, endpoint, input_file, prep_args, batch_size=2000
+    ):
+        """Reads items from a NDJSON file and dispatches them in batches to the Mixpanel API
+
+        This avoids loading all items into memory at once.
+
+        :param base_url: The base API url
+        :param endpoint: Can be 'import', 'engage', 'import-events' or 'import-people'
+        :param input_file: Path to NDJSON file containing items
+        :param prep_args: List of arguments to be provided to the appropriate _prep method
+        :param batch_size: Number of items per batch (Default value = 2000)
+        :type base_url: str
+        :type endpoint: str
+        :type input_file: str
+        :type prep_args: list
+        :type batch_size: int
+
+        """
+        pool = ThreadPool(processes=self.pool_size)
+        batch = []
+
+        if endpoint == "import" or endpoint == "import-events":
+            prep_function = MixpanelUtils._prep_event_for_import
+        elif endpoint == "engage" or endpoint == "import-people":
+            prep_function = MixpanelUtils._prep_params_for_profile
+        elif endpoint == "groups":
+            prep_function = MixpanelUtils._prep_params_for_group_profile
+        else:
+            MixpanelUtils.LOGGER.error(
+                f'endpoint must be "import", "engage", "groups", "import-events" or "import-people", found: {endpoint}'
+            )
+            return
+
+        with open(input_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+
+                if prep_args is not None:
+                    prep_args[0] = item
+                    params = prep_function(*prep_args)
+                    if params:
+                        batch.append(params)
+                else:
+                    batch.append(item)
+
+                if len(batch) == batch_size:
+                    pool.apply_async(
+                        self._send_batch,
+                        args=(base_url, endpoint, batch),
+                        callback=MixpanelUtils._async_response_handler_callback,
+                    )
+                    batch = []
+
+        if len(batch):
+            pool.apply_async(
+                self._send_batch,
+                args=(base_url, endpoint, batch),
+                callback=MixpanelUtils._async_response_handler_callback,
+            )
+        pool.close()
+        pool.join()
 
     def _dispatch_batches(
             self, base_url, endpoint, item_list, prep_args, batch_size=2000

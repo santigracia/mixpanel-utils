@@ -25,8 +25,10 @@ Author: Sean Coonce - https://github.com/cooncesean
 Github repo: https://github.com/cooncesean/mixpanel-query-py
 """
 
+import json
 import math
 import itertools
+import threading
 from multiprocessing.pool import ThreadPool
 
 
@@ -81,6 +83,43 @@ class ConcurrentPaginator(object):
         pool.close()
         pool.join()
         return res
+
+    def fetch_all_to_file(self, output_file, params=None):
+        """
+        Fetch all results from all pages and write each profile as a JSON line
+        to output_file. Returns the total number of results written.
+
+        This avoids holding all results in memory at once.
+        """
+        params = params and params.copy() or {}
+
+        first_page = self.get_func(params)
+        results = first_page["results"]
+        params["session_id"] = first_page["session_id"]
+
+        lock = threading.Lock()
+        count = [len(results)]
+
+        with open(output_file, "w", encoding="utf-8") as f:
+            for profile in results:
+                f.write(json.dumps(profile) + "\n")
+
+            start, end = self._remaining_page_range(first_page)
+
+            def _fetch_and_write(page):
+                req_params = dict(list(params.items()) + [("page", page)])
+                page_results = self.get_func(req_params)["results"]
+                lines = [json.dumps(p) + "\n" for p in page_results]
+                with lock:
+                    f.writelines(lines)
+                    count[0] += len(page_results)
+
+            pool = ThreadPool(processes=self.concurrency)
+            pool.map(_fetch_and_write, list(range(start, end)))
+            pool.close()
+            pool.join()
+
+        return count[0]
 
     def _remaining_page_range(self, response):
         num_pages = math.ceil(response["total"] / float(response["page_size"]))
