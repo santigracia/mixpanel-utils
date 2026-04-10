@@ -25,11 +25,14 @@ Author: Sean Coonce - https://github.com/cooncesean
 Github repo: https://github.com/cooncesean/mixpanel-query-py
 """
 
-import json
 import math
 import itertools
-import threading
 from multiprocessing.pool import ThreadPool
+
+try:
+    import ujson as json
+except ImportError:
+    import json
 
 
 class ConcurrentPaginator(object):
@@ -70,6 +73,50 @@ class ConcurrentPaginator(object):
         fetcher = self._results_fetcher(params)
         return results + self._concurrent_flatmap(fetcher, list(range(start, end)))
 
+    def fetch_all_to_file(self, file_handle, params=None, on_block=None, block_size=100000):
+        """
+        Fetch all results from all pages and write them as JSONL to a file handle.
+
+        Optionally calls `on_block(block_number)` every `block_size` profiles written,
+        and `on_block(None)` as a sentinel when all pages are done.
+
+        Returns the total number of profiles written.
+        """
+        params = params and params.copy() or {}
+        count = 0
+
+        first_page = self.get_func(params)
+        for result in first_page["results"]:
+            file_handle.write(json.dumps(result) + "\n")
+            count += 1
+            if on_block and count % block_size == 0:
+                file_handle.flush()
+                on_block(count // block_size - 1)
+
+        params["session_id"] = first_page["session_id"]
+        start, end = self._remaining_page_range(first_page)
+
+        fetcher = self._results_fetcher(params)
+        pool = ThreadPool(processes=self.concurrency)
+        for page_results in pool.imap_unordered(fetcher, range(start, end)):
+            for result in page_results:
+                file_handle.write(json.dumps(result) + "\n")
+                count += 1
+                if on_block and count % block_size == 0:
+                    file_handle.flush()
+                    on_block(count // block_size - 1)
+        pool.close()
+        pool.join()
+
+        file_handle.flush()
+        # Signal final partial block if any remaining profiles since last block signal
+        if on_block:
+            if count % block_size != 0:
+                on_block(count // block_size)
+            on_block(None)
+
+        return count
+
     def _results_fetcher(self, params):
         def _fetcher_func(page):
             req_params = dict(list(params.items()) + [("page", page)])
@@ -83,43 +130,6 @@ class ConcurrentPaginator(object):
         pool.close()
         pool.join()
         return res
-
-    def fetch_all_to_file(self, output_file, params=None):
-        """
-        Fetch all results from all pages and write each profile as a JSON line
-        to output_file. Returns the total number of results written.
-
-        This avoids holding all results in memory at once.
-        """
-        params = params and params.copy() or {}
-
-        first_page = self.get_func(params)
-        results = first_page["results"]
-        params["session_id"] = first_page["session_id"]
-
-        lock = threading.Lock()
-        count = [len(results)]
-
-        with open(output_file, "w", encoding="utf-8") as f:
-            for profile in results:
-                f.write(json.dumps(profile) + "\n")
-
-            start, end = self._remaining_page_range(first_page)
-
-            def _fetch_and_write(page):
-                req_params = dict(list(params.items()) + [("page", page)])
-                page_results = self.get_func(req_params)["results"]
-                lines = [json.dumps(p) + "\n" for p in page_results]
-                with lock:
-                    f.writelines(lines)
-                    count[0] += len(page_results)
-
-            pool = ThreadPool(processes=self.concurrency)
-            pool.map(_fetch_and_write, list(range(start, end)))
-            pool.close()
-            pool.join()
-
-        return count[0]
 
     def _remaining_page_range(self, response):
         num_pages = math.ceil(response["total"] / float(response["page_size"]))
